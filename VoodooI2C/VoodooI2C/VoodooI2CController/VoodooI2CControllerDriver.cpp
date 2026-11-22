@@ -131,6 +131,11 @@ IOReturn VoodooI2CControllerDriver::getBusConfig() {
     bus_device.acpi_config.fs_hcnt = getNumProperty(kI2CPropFsHCntKey);
     bus_device.acpi_config.fs_lcnt = getNumProperty(kI2CPropFsLCntKey);
     bus_device.access_intr_mask_workaround = getBoolProperty(kI2CPropMaskQuirkKey);
+    // Force the AMD bus-reinit workaround on. Warm reboots leave the
+    // Synopsys DesignWare controller (I2CC/I2CD) with stale FIFO/interrupt
+    // state; re-running initialiseBus() before every transfer rewrites the
+    // bus configuration and recovers it, matching cold-boot behaviour.
+    bus_device.access_intr_mask_workaround = true;
 
     sdaFallNs = getNumProperty(kI2CPropSdaFallNsKey) ?: 300;  // 0.3us default
     sclFallNs = getNumProperty(kI2CPropSclFallNsKey) ?: 300;  // 0.3us default
@@ -309,6 +314,50 @@ IOReturn VoodooI2CControllerDriver::initialiseBus() {
     return kIOReturnSuccess;
 }
 
+IOReturn VoodooI2CControllerDriver::recoverBus() {
+    /*
+     * A warm reboot keeps I2C slaves powered. If the previous session was
+     * killed mid-transaction, a slave can hold SDA low forever and every new
+     * START stalls (observed as kIOReturnTimeout on the first probe). The
+     * DesignWare core can clock the slave out itself: enable bus-clear,
+     * point TAR at the reserved 0x7f address and kick a dummy read; the core
+     * then emits 9 SCL pulses + STOP. Mirrors Linux i2c_dw_unstick_bus().
+     */
+    IOLog("%s::%s Attempting I2C bus recovery\n", getName(), bus_device.name);
+
+    toggleBusState(kVoodooI2CStateOff);
+
+    UInt32 con = readRegister(DW_IC_CON);
+    writeRegister(DW_IC_UNSTICK_ADDRESS, DW_IC_TAR);
+    writeRegister(con | DW_IC_CON_RESTART_EN | DW_IC_CON_BUS_CLEAR_CTRL, DW_IC_CON);
+    writeRegister(DW_IC_INTR_STOP_DET, DW_IC_INTR_MASK);
+
+    toggleBusState(kVoodooI2CStateOn);
+    writeRegister(DW_IC_DATA_CMD_CMD | DW_IC_UNSTICK_DATA, DW_IC_DATA_CMD);
+
+    IOReturn ret = kIOReturnTimeout;
+    for (int i = 0; i < 1000; i++) {
+        UInt32 status = readRegister(DW_IC_RAW_INTR_STAT);
+        if (status & (DW_IC_INTR_STOP_DET | DW_IC_INTR_TX_ABRT)) {
+            ret = kIOReturnSuccess;
+            break;
+        }
+        IODelay(50);
+    }
+
+    readRegister(DW_IC_CLR_STOP_DET);
+    readRegister(DW_IC_CLR_TX_ABRT);
+    readRegister(DW_IC_CLR_INTR);
+
+    toggleBusState(kVoodooI2CStateOff);
+    writeRegister(con, DW_IC_CON);
+    writeRegister(0, DW_IC_INTR_MASK);
+
+    IOLog("%s::%s I2C bus recovery %s\n", getName(), bus_device.name,
+          ret == kIOReturnSuccess ? "completed" : "timed out");
+    return ret;
+}
+
 IOReturn VoodooI2CControllerDriver::prepareTransferI2C(VoodooI2CControllerBusMessage* messages, int* number) {
     IOLog("%s::%s prepareTransfer entered\n", getName(), bus_device.name);
     AbsoluteTime abstime, deadline;
@@ -341,6 +390,9 @@ IOReturn VoodooI2CControllerDriver::prepareTransferI2C(VoodooI2CControllerBusMes
 
     if (sleep == THREAD_TIMED_OUT) {
         IOLog("%s::%s Timeout waiting for bus to accept transfer request\n", getName(), bus_device.name);
+        /* The stall is usually a slave holding SDA low; clock it out before
+         * reprogramming the core so the next caller sees a usable bus. */
+        recoverBus();
         initialiseBus();
         return kIOReturnTimeout;
     }
@@ -642,16 +694,25 @@ bool VoodooI2CControllerDriver::start(IOService* provider) {
      * and enables the SCL/SDA stuck low. SMU FW does the
      * bus recovery process. Driver should not ignore this BIOS
      * advertisement of bus clear feature.
+     *
+     * The SMU only recovers on power transitions, not on warm reboots, so
+     * enable the core's bus-clear unconditionally: a slave left mid-
+     * transaction by the previous session would otherwise hold SDA low and
+     * stall every START until a cold power cycle.
      */
     if (readRegister(DW_IC_CON) & DW_IC_CON_BUS_CLEAR_CTRL) {
         IOLog("%s::%s Bus clear is enabled", getName(), bus_device.name);
-        bus_device.bus_config |= DW_IC_CON_BUS_CLEAR_CTRL;
     }
+    bus_device.bus_config |= DW_IC_CON_BUS_CLEAR_CTRL;
 
     if (initialiseBus() != kIOReturnSuccess) {
         IOLog("%s::%s Could not initialise bus\n", getName(), bus_device.name);
         return false;
     }
+
+    /* Release any slave that held the bus across the reboot before the first
+     * device nub starts probing. */
+    recoverBus();
 
     toggleInterrupts(kVoodooI2CStateOff);
 

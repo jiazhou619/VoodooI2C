@@ -195,6 +195,17 @@ class EXPORT VoodooI2CControllerDriver : public IOService {
 
     IOReturn initialiseBus();
 
+    /* Releases a slave that held SDA low across a warm reboot.
+     *
+     * Runs the DesignWare hardware bus-clear sequence (9 SCL pulses + STOP),
+     * mirroring Linux i2c_dw_unstick_bus(). Safe to call on an idle bus.
+     *
+     * @return *kIOReturnSuccess* when the recovery STOP completed;
+     * *kIOReturnTimeout* if the core never signalled STOP_DET.
+     */
+
+    IOReturn recoverBus();
+
     /* Prepares the driver for an I2C transfer routine
      * @messages The messages to be transferred
      * @number   The number of messages

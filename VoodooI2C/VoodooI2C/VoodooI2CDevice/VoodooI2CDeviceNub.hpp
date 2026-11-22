@@ -30,6 +30,21 @@
 
 class VoodooI2CControllerDriver;
 
+/* Fixed ABI shared with external callers of the "VoodooI2CTransferToAddress"
+ * platform function. Buffers are borrowed for the synchronous call. Do not
+ * reorder, pack or resize: external drivers static_assert this layout. */
+struct VoodooI2CAddressedTransfer {
+    UInt8 address;
+    UInt8* writeBuffer;
+    UInt16 writeLength;
+    UInt8* readBuffer;
+    UInt16 readLength;
+};
+
+#ifndef VOODOO_I2C_TRANSFER_TO_ADDRESS
+#define VOODOO_I2C_TRANSFER_TO_ADDRESS "VoodooI2CTransferToAddress"
+#endif
+
 /* Implements a device nub to which an instance of a device driver may attach. Examples include <VoodooI2CHIDDevice>
  *
  * The members of this class are responsible for low-level interfacing with an I2C slave device. The public
@@ -174,6 +189,18 @@ class EXPORT VoodooI2CDeviceNub : public IOService {
 
     IOReturn writeReadI2C(UInt8* write_buffer, UInt16 write_length, UInt8* read_buffer, UInt16 read_length);
 
+    /* Platform function entry point for external drivers that need a combined
+     * write-read transaction against an explicit slave address (e.g. the
+     * Cirrus amplifier probing a second chip on the same controller).
+     * Dispatched by callPlatformFunction("VoodooI2CTransferToAddress").
+     */
+
+    IOReturn transferI2CToAddress(VoodooI2CAddressedTransfer* transfer);
+
+    IOReturn callPlatformFunction(const OSSymbol* functionName, bool waitForFunction, void* parameter1, void* parameter2, void* parameter3, void* parameter4) override;
+
+    IOReturn callPlatformFunction(const char* functionName, bool waitForFunction, void* parameter1, void* parameter2, void* parameter3, void* parameter4) override;
+
     /* Evaluate _DSM for specific GUID and function index. Assume Revision ID is 1 for now.
      * @uuid Human-readable GUID string (big-endian)
      * @index Function index
@@ -284,6 +311,8 @@ class EXPORT VoodooI2CDeviceNub : public IOService {
      */
 
     IOReturn writeReadI2CGated(UInt8* write_buffer, UInt16* write_length, UInt8* read_buffer, UInt16* read_length);
+
+    IOReturn transferI2CToAddressGated(VoodooI2CAddressedTransfer* transfer);
 
     /* Check if a boot-arg is present
      *

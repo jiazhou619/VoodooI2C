@@ -10,6 +10,7 @@
 #include "VoodooI2CDeviceNub.hpp"
 
 #include <Availability.h>
+#include <string.h>
 
 #ifndef __ACIDANTHERA_MAC_SDK
 #error "This kext SDK is unsupported. Download from https://github.com/acidanthera/MacKernelSDK"
@@ -418,4 +419,58 @@ IOReturn VoodooI2CDeviceNub::writeReadI2CGated(UInt8* write_buffer, UInt16* writ
         }
     };
     return controller->transferI2C(msgs, 2);
+}
+
+IOReturn VoodooI2CDeviceNub::transferI2CToAddress(VoodooI2CAddressedTransfer* transfer) {
+    if (!transfer || (transfer->writeLength && !transfer->writeBuffer) ||
+        (transfer->readLength && !transfer->readBuffer) || (!transfer->writeLength && !transfer->readLength))
+        return kIOReturnBadArgument;
+    return command_gate->runAction(OSMemberFunctionCast(IOCommandGate::Action, this, &VoodooI2CDeviceNub::transferI2CToAddressGated), transfer);
+}
+
+IOReturn VoodooI2CDeviceNub::transferI2CToAddressGated(VoodooI2CAddressedTransfer* transfer) {
+    UInt16 write_flags = 0;
+    UInt16 read_flags = I2C_M_RD;
+    if (use_10bit_addressing) {
+        write_flags |= I2C_M_TEN;
+        read_flags |= I2C_M_TEN;
+    }
+
+    /* Write then read in one controller request: with RESTART_EN this becomes
+     * START-write-RESTART-read, the standard register access pattern. */
+    VoodooI2CControllerBusMessage msgs[2];
+    int count = 0;
+    if (transfer->writeLength) {
+        msgs[count].address = transfer->address;
+        msgs[count].buffer = transfer->writeBuffer;
+        msgs[count].flags = write_flags;
+        msgs[count].length = transfer->writeLength;
+        count++;
+    }
+    if (transfer->readLength) {
+        msgs[count].address = transfer->address;
+        msgs[count].buffer = transfer->readBuffer;
+        msgs[count].flags = read_flags;
+        msgs[count].length = transfer->readLength;
+        count++;
+    }
+    return controller->transferI2C(msgs, count);
+}
+
+IOReturn VoodooI2CDeviceNub::callPlatformFunction(const OSSymbol* functionName, bool waitForFunction, void* parameter1, void* parameter2, void* parameter3, void* parameter4) {
+    if (functionName && functionName->isEqualTo(VOODOO_I2C_TRANSFER_TO_ADDRESS)) {
+        if (!parameter1)
+            return kIOReturnBadArgument;
+        return transferI2CToAddress(static_cast<VoodooI2CAddressedTransfer*>(parameter1));
+    }
+    return super::callPlatformFunction(functionName, waitForFunction, parameter1, parameter2, parameter3, parameter4);
+}
+
+IOReturn VoodooI2CDeviceNub::callPlatformFunction(const char* functionName, bool waitForFunction, void* parameter1, void* parameter2, void* parameter3, void* parameter4) {
+    if (functionName && strcmp(functionName, VOODOO_I2C_TRANSFER_TO_ADDRESS) == 0) {
+        if (!parameter1)
+            return kIOReturnBadArgument;
+        return transferI2CToAddress(static_cast<VoodooI2CAddressedTransfer*>(parameter1));
+    }
+    return super::callPlatformFunction(functionName, waitForFunction, parameter1, parameter2, parameter3, parameter4);
 }

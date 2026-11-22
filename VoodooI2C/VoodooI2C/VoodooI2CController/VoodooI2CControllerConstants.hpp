@@ -166,6 +166,16 @@ DW_IC_TX_ABRT_GCALL_NOACK)
 
 #define DW_IC_CON_BUS_CLEAR_CTRL BIT(11)
 
+/*
+ * Bus recovery (unstick) constants, mirroring Linux i2c_dw_unstick_bus().
+ * A dummy read to the reserved 0x7f address makes the core attempt START;
+ * with IC_CON bus-clear enabled it emits 9 SCL pulses + STOP to release a
+ * slave that held SDA low across a warm reboot.
+ */
+#define DW_IC_DATA_CMD_CMD 0x100
+#define DW_IC_UNSTICK_ADDRESS 0x7f
+#define DW_IC_UNSTICK_DATA 0xff
+
 #if defined(__LP64__) && __LP64__
 #define BITS_PER_LONG 64
 #else
