@@ -390,9 +390,10 @@ IOReturn VoodooI2CControllerDriver::prepareTransferI2C(VoodooI2CControllerBusMes
 
     if (sleep == THREAD_TIMED_OUT) {
         IOLog("%s::%s Timeout waiting for bus to accept transfer request\n", getName(), bus_device.name);
-        /* The stall is usually a slave holding SDA low; clock it out before
-         * reprogramming the core so the next caller sees a usable bus. */
-        recoverBus();
+        /* Do NOT run bus recovery here: a CS35L41 clock-stretching mid-
+         * transaction looks identical to a stuck bus, and the 9-clock + STOP
+         * sequence would corrupt the amplifier's active transfer. Recovery
+         * only runs at controller start, when no transaction can be live. */
         initialiseBus();
         return kIOReturnTimeout;
     }
