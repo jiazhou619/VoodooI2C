@@ -322,39 +322,109 @@ IOReturn VoodooI2CControllerDriver::recoverBus() {
      * DesignWare core can clock the slave out itself: enable bus-clear,
      * point TAR at the reserved 0x7f address and kick a dummy read; the core
      * then emits 9 SCL pulses + STOP. Mirrors Linux i2c_dw_unstick_bus().
+     *
+     * Two corrections over the first revision, both learned from the warm
+     * reboot that still timed out after recovery:
+     *  - The bus-clear bit position is ambiguous (BIT(11) in older headers,
+     *    BIT(12) in current Linux). A write to an unsupported or wrong bit
+     *    is ignored, so each candidate is verified by readback.
+     *  - A bare TX_ABRT on the dummy read means the core NACKed 0x7f like a
+     *    normal address and never clocked the bus free. Only STOP_DET counts
+     *    as a released bus; treating abort as success was a false positive.
      */
     IOLog("%s::%s Attempting I2C bus recovery\n", getName(), bus_device.name);
 
+    /* Captured before anything is touched: a stuck slave shows up as
+     * MST_ACTIVITY/ACTIVITY set while the core is otherwise idle. */
+    setProperty("Recovery Status Entry", readRegister(DW_IC_STATUS), 32);
+    setProperty("Recovery Enable Entry", readRegister(DW_IC_ENABLE_STATUS), 32);
+    setProperty("Recovery Raw Entry", readRegister(DW_IC_RAW_INTR_STAT), 32);
+
+    /* Drop whatever the previous session left in flight (FIFO + state
+     * machine) before disabling: IC_ENABLE.ABORT is the only sanctioned
+     * way to flush a transfer the core still believes is running. */
+    writeRegister(DW_IC_ENABLE_EN | DW_IC_ENABLE_ABORT, DW_IC_ENABLE);
+    IODelay(5000);
+
     toggleBusState(kVoodooI2CStateOff);
 
-    UInt32 con = readRegister(DW_IC_CON);
-    writeRegister(DW_IC_UNSTICK_ADDRESS, DW_IC_TAR);
-    writeRegister(con | DW_IC_CON_RESTART_EN | DW_IC_CON_BUS_CLEAR_CTRL, DW_IC_CON);
-    writeRegister(DW_IC_INTR_STOP_DET, DW_IC_INTR_MASK);
+    const UInt32 con = readRegister(DW_IC_CON);
+    const UInt32 candidates[] = { DW_IC_CON_BUS_CLEAR_CTRL_ALT, DW_IC_CON_BUS_CLEAR_CTRL };
 
-    toggleBusState(kVoodooI2CStateOn);
-    writeRegister(DW_IC_DATA_CMD_CMD | DW_IC_UNSTICK_DATA, DW_IC_DATA_CMD);
+    IOReturn ret = kIOReturnUnsupported;
+    const char* result = "NO_FEATURE";
+    UInt32 raw = 0;
 
-    IOReturn ret = kIOReturnTimeout;
-    for (int i = 0; i < 1000; i++) {
-        UInt32 status = readRegister(DW_IC_RAW_INTR_STAT);
-        if (status & (DW_IC_INTR_STOP_DET | DW_IC_INTR_TX_ABRT)) {
-            ret = kIOReturnSuccess;
-            break;
+    /* IC_CON entry value is diagnostic on its own: seeing the bus-clear bit
+     * already set here would mean the previous boot left it behind, and a
+     * reserved bit that always reads 1 would fake a successful feature test. */
+    setProperty("Recovery Con Entry", con, 32);
+
+    for (size_t c = 0; c < sizeof(candidates) / sizeof(candidates[0]) && ret != kIOReturnSuccess; ++c) {
+        const UInt32 bit = candidates[c];
+        const char* name = c == 0 ? "BIT12" : "BIT11";
+
+        /* Writability test in both directions. A bit that survives a clear is
+         * read-as-1 reserved and cannot be the bus-clear control. */
+        writeRegister(con | bit, DW_IC_CON);
+        const UInt32 setBack = readRegister(DW_IC_CON);
+        writeRegister(con & ~bit, DW_IC_CON);
+        const UInt32 clrBack = readRegister(DW_IC_CON);
+        const bool writable = (setBack & bit) && !(clrBack & bit);
+        setProperty(c == 0 ? "Recovery Con Set BIT12" : "Recovery Con Set BIT11", setBack, 32);
+        setProperty(c == 0 ? "Recovery Con Clr BIT12" : "Recovery Con Clr BIT11", clrBack, 32);
+        if (!writable) {
+            writeRegister(con, DW_IC_CON);
+            setProperty(c == 0 ? "Recovery Try BIT12" : "Recovery Try BIT11", "BIT_NOT_WRITABLE");
+            continue;
         }
-        IODelay(50);
+
+        writeRegister(con | DW_IC_CON_RESTART_EN | bit, DW_IC_CON);
+        result = "TIMEOUT";
+
+        writeRegister(DW_IC_UNSTICK_ADDRESS, DW_IC_TAR);
+        writeRegister(DW_IC_INTR_STOP_DET, DW_IC_INTR_MASK);
+
+        toggleBusState(kVoodooI2CStateOn);
+        setProperty("Recovery Enable After On", readRegister(DW_IC_ENABLE_STATUS), 32);
+        writeRegister(DW_IC_DATA_CMD_CMD | DW_IC_UNSTICK_DATA, DW_IC_DATA_CMD);
+
+        for (int i = 0; i < 20000; i++) { /* up to 1s, like Linux */
+            raw = readRegister(DW_IC_RAW_INTR_STAT);
+            if (raw & (DW_IC_INTR_STOP_DET | DW_IC_INTR_TX_ABRT))
+                break;
+            IODelay(50);
+        }
+
+        setProperty(c == 0 ? "Recovery Status BIT12" : "Recovery Status BIT11", readRegister(DW_IC_STATUS), 32);
+
+        readRegister(DW_IC_CLR_STOP_DET);
+        readRegister(DW_IC_CLR_TX_ABRT);
+        readRegister(DW_IC_CLR_INTR);
+
+        toggleBusState(kVoodooI2CStateOff);
+        writeRegister(con, DW_IC_CON);
+        writeRegister(0, DW_IC_INTR_MASK);
+
+        if (raw & DW_IC_INTR_STOP_DET) {
+            ret = kIOReturnSuccess;
+            result = "STOP";
+            setProperty("Recovery Bit", bit, 32);
+            setProperty("Recovery Winner", name);
+        } else if (raw & DW_IC_INTR_TX_ABRT) {
+            result = "ABORT";
+        }
+        setProperty(c == 0 ? "Recovery Try BIT12" : "Recovery Try BIT11", result);
     }
 
-    readRegister(DW_IC_CLR_STOP_DET);
-    readRegister(DW_IC_CLR_TX_ABRT);
-    readRegister(DW_IC_CLR_INTR);
+    /* Boot-time diagnostics: third-party IOLog is not visible in `log show`,
+     * so the outcome must be readable from the IORegistry. */
+    setProperty("Recovery Result", result);
+    setProperty("Recovery Raw Intr", raw, 32);
+    setProperty("Recovery Con", con, 32);
+    setProperty("Recovery CompParam1", readRegister(DW_IC_COMP_PARAM_1), 32);
 
-    toggleBusState(kVoodooI2CStateOff);
-    writeRegister(con, DW_IC_CON);
-    writeRegister(0, DW_IC_INTR_MASK);
-
-    IOLog("%s::%s I2C bus recovery %s\n", getName(), bus_device.name,
-          ret == kIOReturnSuccess ? "completed" : "timed out");
+    IOLog("%s::%s I2C bus recovery %s\n", getName(), bus_device.name, result);
     return ret;
 }
 
@@ -712,7 +782,9 @@ bool VoodooI2CControllerDriver::start(IOService* provider) {
     }
 
     /* Release any slave that held the bus across the reboot before the first
-     * device nub starts probing. */
+     * device nub starts probing. One attempt only: a wedged slave was proven
+     * to stay wedged for the whole session, so repeated attempts just delay
+     * boot without changing the outcome. */
     recoverBus();
 
     toggleInterrupts(kVoodooI2CStateOff);

@@ -457,11 +457,22 @@ IOReturn VoodooI2CDeviceNub::transferI2CToAddressGated(VoodooI2CAddressedTransfe
     return controller->transferI2C(msgs, count);
 }
 
+IOReturn VoodooI2CDeviceNub::recoverBusGated(void* unused) {
+    if (!controller)
+        return kIOReturnNotAttached;
+    return controller->recoverBus();
+}
+
 IOReturn VoodooI2CDeviceNub::callPlatformFunction(const OSSymbol* functionName, bool waitForFunction, void* parameter1, void* parameter2, void* parameter3, void* parameter4) {
     if (functionName && functionName->isEqualTo(VOODOO_I2C_TRANSFER_TO_ADDRESS)) {
         if (!parameter1)
             return kIOReturnBadArgument;
         return transferI2CToAddress(static_cast<VoodooI2CAddressedTransfer*>(parameter1));
+    }
+    if (functionName && functionName->isEqualTo(VOODOO_I2C_RECOVER_BUS)) {
+        if (!command_gate)
+            return kIOReturnNotAttached;
+        return command_gate->runAction(OSMemberFunctionCast(IOCommandGate::Action, this, &VoodooI2CDeviceNub::recoverBusGated));
     }
     return super::callPlatformFunction(functionName, waitForFunction, parameter1, parameter2, parameter3, parameter4);
 }
@@ -471,6 +482,11 @@ IOReturn VoodooI2CDeviceNub::callPlatformFunction(const char* functionName, bool
         if (!parameter1)
             return kIOReturnBadArgument;
         return transferI2CToAddress(static_cast<VoodooI2CAddressedTransfer*>(parameter1));
+    }
+    if (functionName && strcmp(functionName, VOODOO_I2C_RECOVER_BUS) == 0) {
+        if (!command_gate)
+            return kIOReturnNotAttached;
+        return command_gate->runAction(OSMemberFunctionCast(IOCommandGate::Action, this, &VoodooI2CDeviceNub::recoverBusGated));
     }
     return super::callPlatformFunction(functionName, waitForFunction, parameter1, parameter2, parameter3, parameter4);
 }

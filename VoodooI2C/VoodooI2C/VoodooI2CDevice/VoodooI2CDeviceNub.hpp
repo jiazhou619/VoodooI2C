@@ -45,6 +45,10 @@ struct VoodooI2CAddressedTransfer {
 #define VOODOO_I2C_TRANSFER_TO_ADDRESS "VoodooI2CTransferToAddress"
 #endif
 
+#ifndef VOODOO_I2C_RECOVER_BUS
+#define VOODOO_I2C_RECOVER_BUS "VoodooI2CRecoverBus"
+#endif
+
 /* Implements a device nub to which an instance of a device driver may attach. Examples include <VoodooI2CHIDDevice>
  *
  * The members of this class are responsible for low-level interfacing with an I2C slave device. The public
@@ -313,6 +317,12 @@ class EXPORT VoodooI2CDeviceNub : public IOService {
     IOReturn writeReadI2CGated(UInt8* write_buffer, UInt16* write_length, UInt8* read_buffer, UInt16* read_length);
 
     IOReturn transferI2CToAddressGated(VoodooI2CAddressedTransfer* transfer);
+
+    /* Gated bus recovery for the "VoodooI2CRecoverBus" platform function.
+     * Runs the controller's recoverBus() under the command gate so it cannot
+     * interleave with in-flight transfers. */
+
+    IOReturn recoverBusGated(void* unused);
 
     /* Check if a boot-arg is present
      *

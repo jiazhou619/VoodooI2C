@@ -40,6 +40,7 @@
 #define kI2CPropMaskQuirkKey            "AccessIntrMaskWorkaround"
 
 #define DW_IC_CON_MASTER                0x1
+#define DW_IC_CON_INT_LOOPBACK          BIT(1)
 #define DW_IC_CON_SPEED_STD             0x2
 #define DW_IC_CON_SPEED_FAST            0x4
 #define DW_IC_CON_10BITADDR_MASTER      0x10
@@ -87,6 +88,8 @@
 #define DW_IC_CLR_START_DET 0x64
 #define DW_IC_CLR_GEN_CALL 0x68
 #define DW_IC_ENABLE 0x6c
+#define DW_IC_ENABLE_EN 0x1
+#define DW_IC_ENABLE_ABORT 0x2
 #define DW_IC_STATUS 0x70
 #define DW_IC_TXFLR 0x74
 #define DW_IC_RXFLR 0x78
@@ -164,7 +167,14 @@ DW_IC_TX_ABRT_GCALL_NOACK)
 
 #define DW_IC_STATUS_ACTIVITY 0x1
 
+/*
+ * IC_CON bus-clear bit position is ambiguous across DW cores and driver
+ * trees: older headers (and upstream VoodooI2C) place it at BIT(11), the
+ * current Linux i2c-designware code uses BIT(12). Recovery tries both and
+ * only trusts the candidate that reads back as writable.
+ */
 #define DW_IC_CON_BUS_CLEAR_CTRL BIT(11)
+#define DW_IC_CON_BUS_CLEAR_CTRL_ALT BIT(12)
 
 /*
  * Bus recovery (unstick) constants, mirroring Linux i2c_dw_unstick_bus().
