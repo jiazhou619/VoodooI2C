@@ -68,6 +68,47 @@ bool VoodooI2CACPIController::start(IOService* provider) {
     physical_device.acpi_device = OSDynamicCast(IOACPIPlatformDevice, provider);
     setACPIPowerState(kVoodooI2CStateOn);
 
+    /*
+     * AMD Cezanne (AMDI0010) shares its I2C bus with the PSP.  On a warm
+     * reboot the DesignWare state machine and the PSP's bus-arbitration state
+     * survive from the previous session; Linux only gained a workaround for
+     * this in 2026 (ARBITRATION_SEMAPHORE / lost-arbitration on touchpads).
+     * On this machine only a full power cut reliably clears it.
+     *
+     * The firmware exposes an ACPI RSET method (SRAD -> SMU register write)
+     * that resets the controller.  VoodooI2C never evaluated it.  Invoke it
+     * once here, before any registers are configured or nubs published, to
+     * reproduce the cold-power reset in software.
+     *
+     * Restrict to _UID==1 (I2CB, the Synaptics touchpad controller).  I2CC
+     * drives the touchscreen and I2CD the CS35L41 amplifier; resetting those
+     * would disturb devices the user reports as working.
+     */
+    UInt32 controller_uid = 0;
+    bool is_touchpad_bus =
+        physical_device.acpi_device &&
+        physical_device.acpi_device->evaluateInteger("_UID", &controller_uid) == kIOReturnSuccess &&
+        controller_uid == 1;
+    setProperty("Controller UID", controller_uid, 32);
+    setProperty("Is Touchpad Bus", is_touchpad_bus);
+
+    if (is_touchpad_bus && !legacy_intel_lpss) {
+        OSObject* rset_result = nullptr;
+        IOReturn rset_status = physical_device.acpi_device->evaluateObject("RSET", &rset_result);
+        if (rset_result) {
+            rset_result->release();
+            rset_result = nullptr;
+        }
+        setProperty("Controller RSET Status", rset_status, 32);
+        IOLog("%s::%s ACPI RSET status 0x%x\n", getName(), physical_device.name, rset_status);
+        if (rset_status == kIOReturnSuccess) {
+            setProperty("Controller RSET Done", true);
+            IODelay(100);  // let the SMU finish the reset
+        } else {
+            setProperty("Controller RSET Done", false);
+        }
+    }
+
     if (mapMemory() != kIOReturnSuccess) {
         IOLog("%s::%s Could not map memory\n", getName(), physical_device.name);
         return false;
