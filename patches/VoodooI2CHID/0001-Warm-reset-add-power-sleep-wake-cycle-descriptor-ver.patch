@@ -1,0 +1,221 @@
+From 32e6319ae12651de114f306a7bb634c3f1adc476 Mon Sep 17 00:00:00 2001
+From: jiazhou619 <jiazhou619@163.com>
+Date: Wed, 25 Nov 2026 16:11:45 +0800
+Subject: [PATCH 1/3] Warm reset: add power sleep-wake cycle, descriptor
+ verification and IRQ counters
+
+---
+ VoodooI2CHID/VoodooI2CHIDDevice.cpp | 112 +++++++++++++++++++++++++++-
+ VoodooI2CHID/VoodooI2CHIDDevice.hpp |  17 +++++
+ 2 files changed, 127 insertions(+), 2 deletions(-)
+
+diff --git a/VoodooI2CHID/VoodooI2CHIDDevice.cpp b/VoodooI2CHID/VoodooI2CHIDDevice.cpp
+index 9a4edbb..3dc8075 100644
+--- a/VoodooI2CHID/VoodooI2CHIDDevice.cpp
++++ b/VoodooI2CHID/VoodooI2CHIDDevice.cpp
+@@ -29,6 +29,10 @@ bool VoodooI2CHIDDevice::init(OSDictionary* properties) {
+     interrupt_simulator = NULL;
+     interrupt_source = NULL;
+     ready_for_input = false;
++    warmIrqCount = 0;
++    warmInputReportCount = 0;
++    warmZeroLengthCount = 0;
++    warmLastReportSize = 0;
+ 
+     client_lock = IOLockAlloc();
+ 
+@@ -128,6 +132,19 @@ void VoodooI2CHIDDevice::getInputReport() {
+ 
+     int return_size = report[0] | report[1] << 8;
+ 
++    warmLastReportSize = return_size;
++    if (!return_size)
++        warmZeroLengthCount++;
++    else
++        warmInputReportCount++;
++
++    if (quirks & I2C_HID_QUIRK_WARM_RESET_RECOVERY) {
++        setProperty("WarmIrqCount", warmIrqCount, 32);
++        setProperty("WarmInputReportCount", warmInputReportCount, 32);
++        setProperty("WarmZeroLengthCount", warmZeroLengthCount, 32);
++        setProperty("WarmLastReportSize", warmLastReportSize, 32);
++    }
++
+     if (!return_size) {
+         // IOLog("%s::%s Device sent a 0-length report\n", getName(), name);
+         command_gate->commandWakeup(&reset_event);
+@@ -204,6 +221,7 @@ void VoodooI2CHIDDevice::interruptOccured(OSObject* owner, IOInterruptEventSourc
+     if (!awake)
+         return;
+ 
++    warmIrqCount++;
+     command_gate->attemptAction(OSMemberFunctionCast(IOCommandGate::Action, this, &VoodooI2CHIDDevice::getInputReport));
+ }
+ 
+@@ -316,6 +334,73 @@ IOReturn VoodooI2CHIDDevice::resetHIDDeviceGated() {
+     return kIOReturnSuccess;
+ }
+ 
++/* Warm-reboot recovery reset, ported from Linux i2c-hid-core.c.
++ * ELAN touchpads on AMD controllers (AMDI0010) retain internal state across
++ * warm boots: the I2C bus can be recovered but the touchpad firmware hangs
++ * and never raises its interrupt. A host-initiated RESET alone is not enough
++ * for these chips, so we first drive the HID power state down and back up,
++ * then issue RESET with a fixed delay (no IRQ wait), then power up again.
++ * The sequence is retried up to 3 times and verified by re-reading the HID
++ * descriptor. Diagnostic properties are exposed in IORegistry.
++ */
++IOReturn VoodooI2CHIDDevice::resetHIDDeviceRecovery() {
++    IOReturn ret = kIOReturnSuccess;
++
++    setProperty("WarmResetAttempted", true);
++    setProperty("WarmResetResult", "IN_PROGRESS");
++
++    for (int attempt = 1; attempt <= 3; attempt++) {
++        // 1) Force the HID state machine into sleep, then wake it.
++        //    This is the software closest to the cold-boot power cut that
++        //    is known to restore the touchpad on this machine.
++        ret = setHIDPowerState(kVoodooI2CStateOff);
++        IOSleep(200);
++        ret = setHIDPowerState(kVoodooI2CStateOn);
++        IOSleep(100);
++
++        // 2) Host-initiated RESET command, no IRQ acknowledgment wait.
++        VoodooI2CHIDDeviceCommand command;
++        command.c.reg = hid_descriptor.wCommandRegister;
++        command.c.opcode = 0x01;   // I2C_HID_OPCODE_RESET
++        command.c.report_type_id = 0;
++        ret = api->writeI2C(command.data, 4);
++        if (ret != kIOReturnSuccess) {
++            IOLog("%s::%s WarmReset attempt %d: RESET write failed (0x%x)\n", getName(), name, attempt, ret);
++            IOSleep(200);
++            continue;
++        }
++
++        // 3) Fixed delay instead of waiting for the reset-complete IRQ.
++        IOSleep(150);
++
++        // 4) Power on again after reset.
++        ret = setHIDPowerState(kVoodooI2CStateOn);
++        IOSleep(100);
++
++        setProperty("WarmResetLastAttempt", attempt, 32);
++
++        // 5) Verify that the chip is alive after the cycle by re-reading the
++        //    HID descriptor. A hung chip still ACKs writes but returns stale
++        //    or zeroed descriptor data.
++        if (getHIDDescriptor() == kIOReturnSuccess &&
++            hid_descriptor.wVendorID != 0 && hid_descriptor.wProductID != 0) {
++            setProperty("WarmResetVID", hid_descriptor.wVendorID, 16);
++            setProperty("WarmResetPID", hid_descriptor.wProductID, 16);
++            setProperty("WarmResetResult", "SUCCESS");
++            IOLog("%s::%s WarmReset succeeded on attempt %d (VID=0x%x PID=0x%x)\n",
++                  getName(), name, attempt, hid_descriptor.wVendorID, hid_descriptor.wProductID);
++            return kIOReturnSuccess;
++        }
++
++        IOLog("%s::%s WarmReset attempt %d: descriptor verification failed\n", getName(), name, attempt);
++        IOSleep(200);
++    }
++
++    setProperty("WarmResetResult", "FAILED");
++    IOLog("%s::%s WarmReset failed after 3 attempts\n", getName(), name);
++    return kIOReturnIOError;
++}
++
+ IOReturn VoodooI2CHIDDevice::setHIDPowerState(VoodooI2CState state) {
+     VoodooI2CHIDDeviceCommand command;
+     IOReturn ret = kIOReturnSuccess;
+@@ -407,6 +492,23 @@ void VoodooI2CHIDDevice::lookupQuirks() {
+             quirks = i2c_hid_quirks[n].quirks;
+         }
+     }
++
++    // Detect ELAN touchpads by the ACPI device name on the I2C nub
++    // (e.g. "ELAN3915"). The HID descriptor of these devices often reports
++    // a different vendor/product ID, so name matching is more reliable.
++    // These need the full warm-reboot recovery sequence on AMD controllers.
++    if (api) {
++        OSData* name_data = OSDynamicCast(OSData, api->getProperty("name"));
++        if (name_data) {
++            const char* dev_name = static_cast<const char*>(name_data->getBytesNoCopy());
++            if (dev_name && dev_name[0] == 'E' && dev_name[1] == 'L' &&
++                dev_name[2] == 'A' && dev_name[3] == 'N') {
++                quirks |= I2C_HID_QUIRK_WARM_RESET_RECOVERY;
++                setProperty("WarmResetQuirkEnabled", true);
++                IOLog("%s::%s ELAN device detected, enabling warm-reboot recovery\n", getName(), name);
++            }
++        }
++    }
+ }
+ 
+ IOReturn VoodooI2CHIDDevice::setPowerState(unsigned long whichState, IOService* whatDevice) {
+@@ -427,7 +529,9 @@ IOReturn VoodooI2CHIDDevice::setPowerState(unsigned long whichState, IOService*
+ 
+             startInterrupt();
+ 
+-            if (quirks & I2C_HID_QUIRK_RESET_ON_RESUME) {
++            if (quirks & I2C_HID_QUIRK_WARM_RESET_RECOVERY) {
++                resetHIDDeviceRecovery();
++            } else if (quirks & I2C_HID_QUIRK_RESET_ON_RESUME) {
+                 resetHIDDevice();
+             } else {
+                 setHIDPowerState(kVoodooI2CStateOn);
+@@ -484,7 +588,11 @@ bool VoodooI2CHIDDevice::handleStart(IOService* provider) {
+     startInterrupt();
+ 
+     lookupQuirks();
+-    resetHIDDevice();
++    if (quirks & I2C_HID_QUIRK_WARM_RESET_RECOVERY) {
++        resetHIDDeviceRecovery();
++    } else {
++        resetHIDDevice();
++    }
+ 
+ 
+     PMinit();
+diff --git a/VoodooI2CHID/VoodooI2CHIDDevice.hpp b/VoodooI2CHID/VoodooI2CHIDDevice.hpp
+index e720658..8b82996 100644
+--- a/VoodooI2CHID/VoodooI2CHIDDevice.hpp
++++ b/VoodooI2CHID/VoodooI2CHIDDevice.hpp
+@@ -29,6 +29,10 @@
+ 
+ #define I2C_HID_QUIRK_NO_IRQ_AFTER_RESET    BIT(1)
+ #define I2C_HID_QUIRK_RESET_ON_RESUME       BIT(5)
++// Warm-reboot bus-recovery quirk: ELAN touchpads on AMD (AMDI0010) keep
++// internal state across warm boots. RESET gets no IRQ ack, so run the full
++// Linux i2c-hid sequence (PWR_ON -> RESET -> delay -> PWR_ON) with retries.
++#define I2C_HID_QUIRK_WARM_RESET_RECOVERY   BIT(6)
+ 
+ #define HID_ANY_ID  0xFFFF
+ 
+@@ -246,6 +250,13 @@ class EXPORT VoodooI2CHIDDevice : public IOHIDDevice {
+ 
+     IOReturn resetHIDDevice();
+ 
++    /* Warm-reboot recovery reset, ported from Linux i2c-hid.
++     * PWR_SLEEP -> PWR_ON -> RESET (no IRQ wait) -> PWR_ON, retried up to 3
++     * times, then verified with a fresh HID descriptor read.
++     * Used for ELAN touchpads on AMD that hang after warm boots.
++     */
++    IOReturn resetHIDDeviceRecovery();
++
+     /* Issues an I2C-HID power state command.
+      * @state The power state that the device should enter
+      *
+@@ -293,6 +304,12 @@ class EXPORT VoodooI2CHIDDevice : public IOHIDDevice {
+     bool is_interrupt_started = false;
+     UInt32 quirks = 0;
+ 
++    // Diagnostic counters for the warm-reset experiment (visible in IORegistry)
++    volatile UInt32 warmIrqCount = 0;
++    volatile UInt32 warmInputReportCount = 0;
++    volatile UInt32 warmZeroLengthCount = 0;
++    volatile UInt32 warmLastReportSize = 0;
++
+     /* Queries the I2C-HID device for an input report
+      *
+      * This function is called from the interrupt handler in a new thread. It is thus not called from interrupt context.
+-- 
+2.50.1 (Apple Git-155)
+

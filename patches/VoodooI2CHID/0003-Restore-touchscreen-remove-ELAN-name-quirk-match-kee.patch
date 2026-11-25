@@ -1,0 +1,72 @@
+From 26a4752acb8ffef2f5b121c868ecfc9c18177321 Mon Sep 17 00:00:00 2001
+From: jiazhou619 <jiazhou619@163.com>
+Date: Wed, 25 Nov 2026 17:28:42 +0800
+Subject: [PATCH 3/3] Restore touchscreen: remove ELAN name quirk match, keep
+ only TPDD touchpad
+
+---
+ VoodooI2CHID/VoodooI2CHIDDevice.cpp | 38 +++++++----------------------
+ 1 file changed, 9 insertions(+), 29 deletions(-)
+
+diff --git a/VoodooI2CHID/VoodooI2CHIDDevice.cpp b/VoodooI2CHID/VoodooI2CHIDDevice.cpp
+index 3f5bb83..eb66507 100644
+--- a/VoodooI2CHID/VoodooI2CHIDDevice.cpp
++++ b/VoodooI2CHID/VoodooI2CHIDDevice.cpp
+@@ -493,45 +493,25 @@ void VoodooI2CHIDDevice::lookupQuirks() {
+         }
+     }
+ 
+-    // Enable warm-reboot recovery + diagnostics on the devices that need it.
++    // Enable warm-reboot recovery + diagnostics ONLY on the real touchpad.
+     //
+     // Two distinct I2C HID devices exist on this AMD laptop:
+     //   1. TPDD (name=MSFT0001, VID=0x06CB Synaptics, PID=0xCEA0) ->
+     //      PrecisionTouchpadHIDEventDriver. THIS IS THE REAL TOUCHPAD.
+     //   2. TPNL (name=ELAN3915, VID=0x04F3, PID=0x2E40) ->
+-    //      TouchscreenHIDEventDriver. This is the touchscreen (always works).
++    //      TouchscreenHIDEventDriver. This is the touchscreen.
+     //
+-    // Previous builds matched only the "ELAN" name, which hit the touchscreen
+-    // and never the touchpad. Match the Synaptics touchpad by VID/PID here so
+-    // the recovery sequence and counters land on the correct device.
+-    bool is_target = false;
+-    const char* target_desc = "";
+-
+-    // Real touchpad: Synaptics VID 0x06CB / PID 0xCEA0 (TPDD / MSFT0001).
++    // The touchscreen must stay on the stock path: an earlier build matched
++    // the "ELAN" name and applied the warm-reset sequence to the touchscreen,
++    // which broke it. Do NOT add any ELAN name matching here. Only the
++    // Synaptics touchpad (TPDD) gets the recovery + counters.
+     if (hid_descriptor.wVendorID == 0x06CB &&
+         hid_descriptor.wProductID == 0xCEA0) {
+-        is_target = true;
+-        target_desc = "TPDD/Synaptics touchpad";
+-    }
+-
+-    if (api) {
+-        OSData* name_data = OSDynamicCast(OSData, api->getProperty("name"));
+-        if (name_data) {
+-            const char* dev_name = static_cast<const char*>(name_data->getBytesNoCopy());
+-            if (dev_name && dev_name[0] == 'E' && dev_name[1] == 'L' &&
+-                dev_name[2] == 'A' && dev_name[3] == 'N') {
+-                is_target = true;
+-                target_desc = "ELAN device";
+-            }
+-        }
+-    }
+-
+-    if (is_target) {
+         quirks |= I2C_HID_QUIRK_WARM_RESET_RECOVERY;
+         setProperty("WarmResetQuirkEnabled", true);
+-        setProperty("WarmResetTarget", target_desc);
+-        IOLog("%s::%s %s detected, enabling warm-reboot recovery\n",
+-              getName(), name, target_desc);
++        setProperty("WarmResetTarget", "TPDD/Synaptics touchpad");
++        IOLog("%s::%s TPDD/Synaptics touchpad detected, enabling warm-reboot recovery\n",
++              getName(), name);
+     }
+ }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

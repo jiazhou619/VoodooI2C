@@ -1,0 +1,71 @@
+From 42cad5d36798cf52659e7694f2db90d2011e09ec Mon Sep 17 00:00:00 2001
+From: jiazhou619 <jiazhou619@163.com>
+Date: Wed, 25 Nov 2026 17:16:23 +0800
+Subject: [PATCH 2/3] Target real touchpad (TPDD Synaptics 06CB:CEA0) with warm
+ reset + counters, not ELAN touchscreen
+
+---
+ VoodooI2CHID/VoodooI2CHIDDevice.cpp | 38 +++++++++++++++++++++++------
+ 1 file changed, 31 insertions(+), 7 deletions(-)
+
+diff --git a/VoodooI2CHID/VoodooI2CHIDDevice.cpp b/VoodooI2CHID/VoodooI2CHIDDevice.cpp
+index 3dc8075..3f5bb83 100644
+--- a/VoodooI2CHID/VoodooI2CHIDDevice.cpp
++++ b/VoodooI2CHID/VoodooI2CHIDDevice.cpp
+@@ -493,22 +493,46 @@ void VoodooI2CHIDDevice::lookupQuirks() {
+         }
+     }
+ 
+-    // Detect ELAN touchpads by the ACPI device name on the I2C nub
+-    // (e.g. "ELAN3915"). The HID descriptor of these devices often reports
+-    // a different vendor/product ID, so name matching is more reliable.
+-    // These need the full warm-reboot recovery sequence on AMD controllers.
++    // Enable warm-reboot recovery + diagnostics on the devices that need it.
++    //
++    // Two distinct I2C HID devices exist on this AMD laptop:
++    //   1. TPDD (name=MSFT0001, VID=0x06CB Synaptics, PID=0xCEA0) ->
++    //      PrecisionTouchpadHIDEventDriver. THIS IS THE REAL TOUCHPAD.
++    //   2. TPNL (name=ELAN3915, VID=0x04F3, PID=0x2E40) ->
++    //      TouchscreenHIDEventDriver. This is the touchscreen (always works).
++    //
++    // Previous builds matched only the "ELAN" name, which hit the touchscreen
++    // and never the touchpad. Match the Synaptics touchpad by VID/PID here so
++    // the recovery sequence and counters land on the correct device.
++    bool is_target = false;
++    const char* target_desc = "";
++
++    // Real touchpad: Synaptics VID 0x06CB / PID 0xCEA0 (TPDD / MSFT0001).
++    if (hid_descriptor.wVendorID == 0x06CB &&
++        hid_descriptor.wProductID == 0xCEA0) {
++        is_target = true;
++        target_desc = "TPDD/Synaptics touchpad";
++    }
++
+     if (api) {
+         OSData* name_data = OSDynamicCast(OSData, api->getProperty("name"));
+         if (name_data) {
+             const char* dev_name = static_cast<const char*>(name_data->getBytesNoCopy());
+             if (dev_name && dev_name[0] == 'E' && dev_name[1] == 'L' &&
+                 dev_name[2] == 'A' && dev_name[3] == 'N') {
+-                quirks |= I2C_HID_QUIRK_WARM_RESET_RECOVERY;
+-                setProperty("WarmResetQuirkEnabled", true);
+-                IOLog("%s::%s ELAN device detected, enabling warm-reboot recovery\n", getName(), name);
++                is_target = true;
++                target_desc = "ELAN device";
+             }
+         }
+     }
++
++    if (is_target) {
++        quirks |= I2C_HID_QUIRK_WARM_RESET_RECOVERY;
++        setProperty("WarmResetQuirkEnabled", true);
++        setProperty("WarmResetTarget", target_desc);
++        IOLog("%s::%s %s detected, enabling warm-reboot recovery\n",
++              getName(), name, target_desc);
++    }
+ }
+ 
+ IOReturn VoodooI2CHIDDevice::setPowerState(unsigned long whichState, IOService* whatDevice) {
+-- 
+2.50.1 (Apple Git-155)
+
